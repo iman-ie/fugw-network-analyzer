@@ -1,0 +1,444 @@
+import numpy as np
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+import seaborn as sns
+import ot
+import time
+from multiprocessing import Pool, cpu_count
+from functools import partial
+
+
+def load_graph_data(net_file, node_file, seed=42):
+    """Load network and node data from CSV files."""
+    try:
+        edges = pd.read_csv(net_file)
+        edges.columns = edges.columns.str.strip()
+        nodes = pd.read_csv(node_file)
+        nodes.columns = nodes.columns.str.strip()
+
+        connected_ids = set(edges['init_node']).union(set(edges['term_node']))
+        nodes = nodes[nodes['Node'].isin(connected_ids)].reset_index(drop=True)
+
+        np.random.seed(seed)
+        demands = np.random.uniform(20, 100, len(nodes))
+
+        return edges, nodes, demands
+    except FileNotFoundError as e:
+        print(f"Error: File not found - {e}")
+        return None, None, None
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None, None, None
+
+
+def create_distance_matrix(edges, nodes):
+    """Create shortest-path distance matrix."""
+    n_nodes = len(nodes)
+    id_to_idx = {node_id: idx for idx, node_id in enumerate(nodes['Node'])}
+
+    G = nx.Graph()
+    for _, row in edges.iterrows():
+        if row['init_node'] not in id_to_idx or row['term_node'] not in id_to_idx:
+            continue
+        i, j = id_to_idx[row['init_node']], id_to_idx[row['term_node']]
+        x1, y1 = nodes.loc[i, ['X', 'Y']]
+        x2, y2 = nodes.loc[j, ['X', 'Y']]
+        dist = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        G.add_edge(i, j, weight=dist)
+
+    dist_matrix = np.full((n_nodes, n_nodes), np.inf)
+    for i, lengths in nx.all_pairs_dijkstra_path_length(G, weight="weight"):
+        for j, d in lengths.items():
+            dist_matrix[i, j] = d
+
+    max_finite = np.nanmax(dist_matrix[np.isfinite(dist_matrix)])
+    dist_matrix[np.isinf(dist_matrix)] = max_finite * 5
+
+    return dist_matrix, G, id_to_idx
+
+
+def process_single_edge(edge_idx, edges, nodes, demands, baseline_dict, time_noise, times, G, alphas):
+    """Process a single edge removal with multiple alpha values."""
+    try:
+        row = edges.iloc[edge_idx]
+        init_node, term_node = row['init_node'], row['term_node']
+
+        id_to_idx = {node_id: idx for idx, node_id in enumerate(nodes['Node'])}
+        if init_node not in id_to_idx or term_node not in id_to_idx:
+            return None
+
+        i, j = id_to_idx[init_node], id_to_idx[term_node]
+
+        # Compute edge betweenness centrality
+        edge_bt = nx.edge_betweenness_centrality(G, weight='weight').get((i, j), 0)
+        norm_bt = edge_bt / max(nx.edge_betweenness_centrality(G, weight='weight').values(), default=1)
+        reduction_factor = 1 - (0.5 + 0.4 * norm_bt)
+
+        # Remove edge and recalculate distances
+        modified_edges = edges.drop(edge_idx).reset_index(drop=True)
+        C_mod, _, _ = create_distance_matrix(modified_edges, nodes)
+
+        # Perturb demands at affected nodes
+        demands_mod = demands.copy()
+        demands_mod[i] *= reduction_factor
+        demands_mod[j] *= reduction_factor
+
+        # Create modified cost matrices with same noise as baseline
+        C_mod_dict = {t: C_mod * f * time_noise[t]
+                      for t, f in zip(times, [1.3, 1.0, 1.2, 0.8])}
+
+        # Store results for each alpha
+        alpha_results = {alpha: [] for alpha in alphas}
+
+        for t in times:
+            # Prepare matrices
+            C_base = baseline_dict[t]
+            C_pert = C_mod_dict[t]
+
+            # Normalize for stability
+            C_base_norm = C_base / C_base.max()
+            C_pert_norm = C_pert / C_pert.max()
+
+            # Feature matrix: node demands as features
+            X1 = demands.reshape(-1, 1)
+            X2 = demands_mod.reshape(-1, 1)
+            M = ot.dist(X1, X2)
+            M = M / M.max() if M.max() > 0 else M
+
+            # Convert distributions to numpy
+            p = demands / demands.sum()
+            q = demands_mod / demands.sum()
+
+            # Compute FUGW for each alpha value
+            for alpha in alphas:
+                try:
+                    pi_samp, pi_samp2, log_dict = ot.gromov.fused_unbalanced_gromov_wasserstein(
+                        C_base_norm, C_pert_norm,
+                        wx=p, wy=q, M=M,
+                        alpha=alpha, reg_marginals=0.012664, epsilon=0.100987, max_iter_ot=900,
+                        log=True
+                    )
+                    alpha_results[alpha].append(log_dict['fugw_cost'])
+                except Exception as e:
+                    print(f"FUGW error for edge {init_node}-{term_node}, time {t}, alpha={alpha}: {e}")
+                    alpha_results[alpha].append(np.nan)
+
+        # Calculate mean and std for each alpha
+        result = {
+            "init_node": init_node,
+            "term_node": term_node,
+        }
+
+        for alpha in alphas:
+            vals = alpha_results[alpha]
+            result[f"FUGW_alpha_{alpha}"] = np.nanmean(vals)
+            result[f"FUGW_alpha_{alpha}_std"] = np.nanstd(vals)
+
+        # Print results
+        print(f"Edge {init_node}-{term_node}:")
+        for alpha in alphas:
+            vals = alpha_results[alpha]
+            print(f"  Alpha {alpha}: {[f'{v:.4f}' for v in vals]} (avg={np.nanmean(vals):.4f})")
+
+        return result
+    except Exception as e:
+        print(f"Error processing edge {edge_idx}: {e}")
+        return None
+
+
+def edge_removal_analysis(edges, nodes, demands, baseline_dict, time_noise,
+                          alphas, output_csv="edge_distances_fugw_alpha.csv", n_jobs=-1):
+    """Analyze all edge removals with parallelization."""
+    start_time = time.time()
+    times = list(baseline_dict.keys())
+
+    _, G, _ = create_distance_matrix(edges, nodes)
+
+    print(f"Analyzing {len(edges)} edges with alpha values: {alphas}")
+    print(f"Using parallelization...")
+    n_processes = cpu_count() if n_jobs == -1 else min(n_jobs, cpu_count())
+    print(f"Using {n_processes} CPU cores")
+
+    process_func = partial(process_single_edge, edges=edges, nodes=nodes,
+                           demands=demands, baseline_dict=baseline_dict,
+                           time_noise=time_noise, times=times, G=G, alphas=alphas)
+
+    try:
+        with Pool(processes=n_processes) as pool:
+            results = pool.map(process_func, range(len(edges)))
+    except KeyboardInterrupt:
+        print("Analysis interrupted by user.")
+        results = []
+    except Exception as e:
+        print(f"Error in parallel processing: {e}")
+        results = []
+
+    results = [r for r in results if r is not None]
+
+    elapsed = time.time() - start_time
+    print(f"\nCompleted in {elapsed:.2f}s ({elapsed / len(results):.3f}s per edge)")
+
+    if results:
+        # Save all results
+        df = pd.DataFrame(results)
+        df.to_csv(output_csv, index=False)
+        print(f"Results saved to {output_csv}")
+    else:
+        print("No results to save.")
+
+    return results
+
+
+def plot_individual_networks(results, nodes, G, id_to_idx, demands, alphas):
+    """Create separate network plots for each alpha value."""
+    pos = {i: (nodes.loc[i, 'X'], nodes.loc[i, 'Y']) for i in range(len(nodes))}
+
+    for alpha in alphas:
+        fig, ax = plt.subplots(figsize=(14, 12))
+
+        # Sort by current alpha
+        sorted_results = sorted(results,
+                                key=lambda x: x[f"FUGW_alpha_{alpha}"],
+                                reverse=True)
+
+        # Draw base network
+        nx.draw_networkx_edges(G, pos, alpha=0.2, width=1.5, edge_color='lightgray', ax=ax)
+
+        # Highlight top 10 edges for this alpha
+        top_10_edges = [(id_to_idx[r["init_node"]], id_to_idx[r["term_node"]])
+                        for r in sorted_results[:10]]
+
+        # Draw top 10 edges with gradient colors
+        edge_colors = plt.cm.Reds(np.linspace(0.9, 0.5, 10))
+        for idx, (i, j) in enumerate(top_10_edges):
+            if G.has_edge(i, j):
+                nx.draw_networkx_edges(G, pos, edgelist=[(i, j)], width=5,
+                                       edge_color=[edge_colors[idx]], ax=ax,
+                                       alpha=0.9)
+
+        # Draw nodes without labels
+        nx.draw_networkx_nodes(G, pos, node_size=demands * 8,
+                               node_color='skyblue', edgecolors='navy',
+                               linewidths=2, ax=ax, alpha=0.8)
+
+        # Add legend for top edges
+        legend_elements = [plt.Line2D([0], [0], color=edge_colors[i], linewidth=4,
+                                      label=f"#{i + 1}: {sorted_results[i]['init_node']}-{sorted_results[i]['term_node']} "
+                                            f"({sorted_results[i][f'FUGW_alpha_{alpha}']:.4f})")
+                           for i in range(min(10, len(sorted_results)))]
+
+        ax.legend(handles=legend_elements, loc='upper left', fontsize=9,
+                  framealpha=0.9, title=f'Top 10 Critical Edges (Alpha={alpha})')
+
+        ax.set_title(f'Critical Edges Analysis - Alpha = {alpha}\n'
+                     f'Network: {len(nodes)} nodes, {G.number_of_edges()} edges',
+                     fontsize=16, fontweight='bold', pad=20)
+        ax.axis('off')
+        plt.tight_layout()
+        plt.savefig(f'network_alpha_{alpha}.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved network plot for alpha={alpha}")
+
+
+def create_comprehensive_analysis(results, alphas):
+    """Create comprehensive analytical charts."""
+
+    # Chart 1: Heatmap of FUGW distances for top edges across alphas
+    fig, ax = plt.subplots(figsize=(14, 10))
+
+    # Get top 20 edges for alpha=0.5 (balanced)
+    sorted_results = sorted(results, key=lambda x: x[f"FUGW_alpha_0.5"], reverse=True)[:20]
+
+    heatmap_data = []
+    edge_labels = []
+    for r in sorted_results:
+        row = [r[f"FUGW_alpha_{alpha}"] for alpha in alphas]
+        heatmap_data.append(row)
+        edge_labels.append(f"{r['init_node']}-{r['term_node']}")
+
+    sns.heatmap(heatmap_data, xticklabels=alphas, yticklabels=edge_labels,
+                cmap='YlOrRd', annot=True, fmt='.4f', cbar_kws={'label': 'FUGW Distance'},
+                ax=ax, linewidths=0.5)
+    ax.set_xlabel('Alpha Value', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Edge', fontsize=12, fontweight='bold')
+    ax.set_title('FUGW Distance Heatmap: Top 20 Edges Across Alpha Values',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('heatmap_fugw_alpha.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Saved heatmap analysis")
+
+    # Chart 2: Line plot comparing top 30 edges
+    fig, ax = plt.subplots(figsize=(14, 8))
+    for alpha in alphas:
+        sorted_results = sorted(results, key=lambda x: x[f"FUGW_alpha_{alpha}"], reverse=True)
+        values = [r[f"FUGW_alpha_{alpha}"] for r in sorted_results[:30]]
+        ax.plot(range(1, len(values) + 1), values, marker='o', markersize=6,
+                label=f'Alpha = {alpha}', linewidth=2.5, alpha=0.8)
+
+    ax.set_xlabel('Edge Rank', fontsize=12, fontweight='bold')
+    ax.set_ylabel('FUGW Distance', fontsize=12, fontweight='bold')
+    ax.set_title('Top 30 Critical Edges - FUGW Distance by Alpha',
+                 fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10, loc='best')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    plt.tight_layout()
+    plt.savefig('line_comparison_alpha.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Saved line comparison plot")
+
+    # Chart 3: Box plot of FUGW distributions
+    fig, ax = plt.subplots(figsize=(12, 8))
+    box_data = []
+    for alpha in alphas:
+        values = [r[f"FUGW_alpha_{alpha}"] for r in results]
+        box_data.append(values)
+
+    bp = ax.boxplot(box_data, labels=alphas, patch_artist=True,
+                    boxprops=dict(facecolor='lightblue', alpha=0.7),
+                    medianprops=dict(color='red', linewidth=2),
+                    whiskerprops=dict(linewidth=1.5),
+                    capprops=dict(linewidth=1.5))
+
+    ax.set_xlabel('Alpha Value', fontsize=12, fontweight='bold')
+    ax.set_ylabel('FUGW Distance', fontsize=12, fontweight='bold')
+    ax.set_title('Distribution of FUGW Distances Across All Edges',
+                 fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig('boxplot_fugw_alpha.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Saved box plot")
+
+    # Chart 4: Bar chart of mean FUGW by alpha
+    fig, ax = plt.subplots(figsize=(10, 7))
+    means = [np.mean([r[f"FUGW_alpha_{alpha}"] for r in results]) for alpha in alphas]
+    stds = [np.std([r[f"FUGW_alpha_{alpha}"] for r in results]) for alpha in alphas]
+
+    bars = ax.bar(range(len(alphas)), means, yerr=stds, capsize=8,
+                  color=plt.cm.viridis(np.linspace(0.2, 0.9, len(alphas))),
+                  edgecolor='black', linewidth=1.5, alpha=0.8)
+
+    ax.set_xticks(range(len(alphas)))
+    ax.set_xticklabels(alphas)
+    ax.set_xlabel('Alpha Value', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Mean FUGW Distance', fontsize=12, fontweight='bold')
+    ax.set_title('Mean FUGW Distance by Alpha (with Std Dev)',
+                 fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Add value labels on bars
+    for i, (bar, mean) in enumerate(zip(bars, means)):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2., height,
+                f'{mean:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig('bar_mean_fugw_alpha.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Saved bar chart")
+
+    # Chart 5: Ranking consistency analysis
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # Track rank changes for top 15 edges
+    edge_ranks = {}
+    for alpha in alphas:
+        sorted_results = sorted(results, key=lambda x: x[f"FUGW_alpha_{alpha}"], reverse=True)
+        for rank, r in enumerate(sorted_results[:15], 1):
+            edge_key = f"{r['init_node']}-{r['term_node']}"
+            if edge_key not in edge_ranks:
+                edge_ranks[edge_key] = []
+            edge_ranks[edge_key].append(rank)
+
+    # Plot rank trajectories
+    for edge_key, ranks in edge_ranks.items():
+        if len(ranks) == len(alphas):  # Only plot edges that appear in all alphas
+            ax.plot(alphas, ranks, marker='o', linewidth=2, alpha=0.6, label=edge_key)
+
+    ax.set_xlabel('Alpha Value', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Rank', fontsize=12, fontweight='bold')
+    ax.set_title('Ranking Consistency: Top 15 Edges Across Alpha Values',
+                 fontsize=14, fontweight='bold')
+    ax.invert_yaxis()  # Higher ranks at top
+    ax.grid(True, alpha=0.3)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    plt.tight_layout()
+    plt.savefig('ranking_consistency_alpha.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Saved ranking consistency plot")
+
+    # Chart 6: Correlation matrix between alpha values
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    correlation_matrix = np.zeros((len(alphas), len(alphas)))
+    for i, alpha1 in enumerate(alphas):
+        for j, alpha2 in enumerate(alphas):
+            values1 = [r[f"FUGW_alpha_{alpha1}"] for r in results]
+            values2 = [r[f"FUGW_alpha_{alpha2}"] for r in results]
+            correlation_matrix[i, j] = np.corrcoef(values1, values2)[0, 1]
+
+    sns.heatmap(correlation_matrix, xticklabels=alphas, yticklabels=alphas,
+                cmap='coolwarm', annot=True, fmt='.3f', center=0.5,
+                cbar_kws={'label': 'Correlation'}, ax=ax, vmin=0, vmax=1)
+    ax.set_title('Correlation Matrix: FUGW Distances Between Alpha Values',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('correlation_matrix_alpha.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Saved correlation matrix")
+
+
+def main():
+    NODE_FILE = 'friedrichshain-center_node.csv'
+    EDGE_FILE = 'friedrichshain-center_net.csv'
+    times = ['morning', 'noon', 'afternoon', 'night']
+    SEED = 42
+    ALPHAS = [0, 0.2, 0.5, 0.7, 1]
+
+    edges, nodes, demands = load_graph_data(EDGE_FILE, NODE_FILE, seed=SEED)
+    if edges is None or nodes is None or demands is None:
+        return
+
+    baseline_matrix, G, id_to_idx = create_distance_matrix(edges, nodes)
+
+    np.random.seed(SEED)
+    time_noise = {t: np.random.uniform(0.9, 1.1, (len(nodes), len(nodes))) for t in times}
+    baseline_dict = {t: baseline_matrix * f * time_noise[t]
+                     for t, f in zip(times, [1.3, 1.0, 1.2, 0.8])}
+
+    print(f"Network: {len(nodes)} nodes, {G.number_of_edges()} edges")
+
+    results = edge_removal_analysis(edges, nodes, demands, baseline_dict,
+                                    time_noise, alphas=ALPHAS, n_jobs=-1)
+
+    if results:
+        print(f"\n{'=' * 100}")
+        print(f"Top 10 Critical Edges for Each Alpha Value:")
+        print(f"{'=' * 100}")
+
+        for alpha in ALPHAS:
+            sorted_results = sorted(results,
+                                    key=lambda x: x[f"FUGW_alpha_{alpha}"],
+                                    reverse=True)
+            print(f"\nAlpha = {alpha}:")
+            print("-" * 80)
+            for idx, r in enumerate(sorted_results[:10], 1):
+                print(f"{idx}. {r['init_node']} - {r['term_node']}: "
+                      f"FUGW = {r[f'FUGW_alpha_{alpha}']:.4f} ± "
+                      f"{r[f'FUGW_alpha_{alpha}_std']:.4f}")
+
+        print("\nGenerating visualizations...")
+
+        # Create individual network plots for each alpha
+        plot_individual_networks(results, nodes, G, id_to_idx, demands, ALPHAS)
+
+        # Create comprehensive analysis charts
+        create_comprehensive_analysis(results, ALPHAS)
+
+        print("\nAll visualizations completed!")
+
+
+if __name__ == "__main__":
+    main()
